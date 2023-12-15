@@ -1,5 +1,6 @@
-# EfficientAD
-Unofficial implementation of paper https://arxiv.org/abs/2303.14535
+# EfficientAD (Adapted)
+
+This code is adapted from the [unofficial implementation](https://github.com/nelson1425/EfficientAD) of the paper https://arxiv.org/abs/2303.14535
 
 [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/efficientad-accurate-visual-anomaly-detection/anomaly-detection-on-mvtec-loco-ad)](https://paperswithcode.com/sota/anomaly-detection-on-mvtec-loco-ad?p=efficientad-accurate-visual-anomaly-detection)
 
