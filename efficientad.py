@@ -11,8 +11,14 @@ import os
 import random
 from tqdm import tqdm
 from common import get_autoencoder, get_pdn_small, get_pdn_medium, \
-    ImageFolderWithoutTarget, ImageFolderWithPath, InfiniteDataloader
+    ImageFolderWithoutTarget, ImageFolderWithPath, InfiniteDataloader, calculate_f1_max
 from sklearn.metrics import roc_auc_score
+
+import matplotlib.pyplot as plt
+import csv
+from PIL import Image
+import mlflow
+from mlflow import log_artifacts, log_metric, log_param, log_figure
 
 def get_argparse():
     parser = argparse.ArgumentParser()
@@ -37,6 +43,9 @@ def get_argparse():
                         default='./mvtec_loco_anomaly_detection',
                         help='Downloaded Mvtec LOCO dataset')
     parser.add_argument('-t', '--train_steps', type=int, default=70000)
+
+    parser.add_argument('-sf', '--stage_inference', action='store_true')
+    parser.add_argument('-aug', '--img_aug', action='store_true')
     return parser.parse_args()
 
 # constants
@@ -56,6 +65,22 @@ transform_ae = transforms.RandomChoice([
     transforms.ColorJitter(contrast=0.2),
     transforms.ColorJitter(saturation=0.2)
 ])
+
+
+# data augmentation transform
+aug_transformations_mvtec_ad = [
+    transforms.RandomAffine(degrees=5, translate=(0.1, 0.1), scale=(0.95, 1.05)),
+    transforms.ColorJitter(brightness=0.1, contrast=0.1),
+    transforms.GaussianBlur(kernel_size=3)
+]
+aug_transformations_all = [
+    transforms.RandomAffine(degrees=5, translate=(0.1, 0.1), scale=(0.95, 1.05)),
+    transforms.ColorJitter(brightness=0.1, contrast=0.1),
+    transforms.GaussianBlur(kernel_size=3),
+    transforms.RandomApply([transforms.ColorJitter(brightness=0.1, contrast=0.1), transforms.RandomAffine(degrees=0, shear=0.1, scale=(1.0, 1.1))], p=0.5),
+    transforms.RandomChoice([transforms.RandomHorizontalFlip(), transforms.RandomVerticalFlip()])
+]
+
 
 def train_transform(image):
     return default_transform(image), default_transform(transform_ae(image))
@@ -78,20 +103,44 @@ def main():
     if config.imagenet_train_path == 'none':
         pretrain_penalty = False
 
+
     # create output dir
     train_output_dir = os.path.join(config.output_dir, 'trainings',
                                     config.dataset, config.subdataset)
     test_output_dir = os.path.join(config.output_dir, 'anomaly_maps',
                                    config.dataset, config.subdataset, 'test')
-    os.makedirs(train_output_dir)
-    os.makedirs(test_output_dir)
+    if not config.stage_inference:
+        os.makedirs(train_output_dir, exist_ok=True)
+        os.makedirs(test_output_dir, exist_ok=True)
 
-    # load data
-    full_train_set = ImageFolderWithoutTarget(
-        os.path.join(dataset_path, config.subdataset, 'train'),
-        transform=transforms.Lambda(train_transform))
-    test_set = ImageFolderWithPath(
-        os.path.join(dataset_path, config.subdataset, 'test'))
+    # data augmentation
+    img_aug_path_to_check = os.path.join(dataset_path, config.subdataset, 'train', 'good_aug')
+    if config.img_aug:
+        if not os.path.exists(img_aug_path_to_check): 
+            os.makedirs(img_aug_path_to_check)
+            if config.dataset == 'mvtec_ad':
+                for i, trans in enumerate(aug_transformations_mvtec_ad):
+                    for input_image in os.listdir(os.path.join(dataset_path, config.subdataset, 'train', 'good')):
+                        augmented_image = trans(Image.open(os.path.join(dataset_path, config.subdataset, 'train', 'good', input_image)))
+                        augmented_image.save(os.path.join(img_aug_path_to_check, str(i) + '_' + input_image))
+            else:
+                for i, trans in enumerate(aug_transformations_all):
+                    for input_image in os.listdir(os.path.join(dataset_path, config.subdataset, 'train', 'good')):
+                        augmented_image = trans(Image.open(os.path.join(dataset_path, config.subdataset, 'train', 'good', input_image)))
+                        augmented_image.save(os.path.join(img_aug_path_to_check, str(i) + '_' + input_image))
+        else:
+            print("the augmented images are already generated and saved in %s"%img_aug_path_to_check)
+
+    # load data, with or without augmented data
+    if config.img_aug:
+        full_train_set = ImageFolderWithoutTarget(
+            os.path.join(dataset_path, config.subdataset, 'train'),
+            transform=transforms.Lambda(train_transform))
+    else:
+        full_train_set = ImageFolderWithoutTarget(
+            os.path.join(dataset_path, config.subdataset, 'train', 'good'),
+            transform=transforms.Lambda(train_transform))
+
     if config.dataset == 'mvtec_ad':
         # mvtec dataset paper recommend 10% validation set
         train_size = int(0.9 * len(full_train_set))
@@ -109,9 +158,11 @@ def main():
     else:
         raise Exception('Unknown config.dataset')
 
+    test_set = ImageFolderWithPath(
+        os.path.join(dataset_path, config.subdataset, 'test'))
 
-    train_loader = DataLoader(train_set, batch_size=1, shuffle=True,
-                              num_workers=4, pin_memory=True)
+
+    train_loader = DataLoader(train_set, batch_size=1, shuffle=True, num_workers=4, pin_memory=True)
     train_loader_infinite = InfiniteDataloader(train_loader)
     validation_loader = DataLoader(validation_set, batch_size=1)
 
@@ -146,10 +197,18 @@ def main():
     teacher.load_state_dict(state_dict)
     autoencoder = get_autoencoder(out_channels)
 
-    # teacher frozen
-    teacher.eval()
-    student.train()
-    autoencoder.train()
+    if not config.stage_inference:
+        teacher.eval()
+        student.train()
+        autoencoder.train()
+    else:
+        # only want to evaluate image classification after training
+        teacher = torch.load(os.path.join(train_output_dir, 'teacher_final.pth'))
+        student = torch.load(os.path.join(train_output_dir, 'student_final.pth'))
+        autoencoder = torch.load(os.path.join(train_output_dir, 'autoencoder_final.pth'))
+        teacher.eval()
+        student.eval()
+        autoencoder.eval()
 
     if on_gpu:
         teacher.cuda()
@@ -158,112 +217,147 @@ def main():
 
     teacher_mean, teacher_std = teacher_normalization(teacher, train_loader)
 
-    optimizer = torch.optim.Adam(itertools.chain(student.parameters(),
-                                                 autoencoder.parameters()),
-                                 lr=1e-4, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, step_size=int(0.95 * config.train_steps), gamma=0.1)
-    tqdm_obj = tqdm(range(config.train_steps))
-    for iteration, (image_st, image_ae), image_penalty in zip(
-            tqdm_obj, train_loader_infinite, penalty_loader_infinite):
-        if on_gpu:
-            image_st = image_st.cuda()
-            image_ae = image_ae.cuda()
+
+    if not config.stage_inference:
+        optimizer = torch.optim.Adam(itertools.chain(student.parameters(),
+                                                     autoencoder.parameters()),
+                                     lr=1e-4, weight_decay=1e-5)
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=int(0.95 * config.train_steps), gamma=0.1)
+        tqdm_obj = tqdm(range(config.train_steps))
+
+        train_loss_avg = 0.
+        mlflow.start_run()
+        mlflow.log_artifacts(config.output_dir)
+        for iteration, (image_st, image_ae), image_penalty in zip(
+                tqdm_obj, train_loader_infinite, penalty_loader_infinite):
+            if on_gpu:
+                image_st = image_st.cuda()
+                image_ae = image_ae.cuda()
+                if image_penalty is not None:
+                    image_penalty = image_penalty.cuda()
+            with torch.no_grad():
+                teacher_output_st = teacher(image_st)
+                teacher_output_st = (teacher_output_st - teacher_mean) / teacher_std
+            student_output_st = student(image_st)[:, :out_channels]
+            distance_st = (teacher_output_st - student_output_st) ** 2
+            d_hard = torch.quantile(distance_st, q=0.999)
+            loss_hard = torch.mean(distance_st[distance_st >= d_hard])
+
             if image_penalty is not None:
-                image_penalty = image_penalty.cuda()
-        with torch.no_grad():
-            teacher_output_st = teacher(image_st)
-            teacher_output_st = (teacher_output_st - teacher_mean) / teacher_std
-        student_output_st = student(image_st)[:, :out_channels]
-        distance_st = (teacher_output_st - student_output_st) ** 2
-        d_hard = torch.quantile(distance_st, q=0.999)
-        loss_hard = torch.mean(distance_st[distance_st >= d_hard])
+                student_output_penalty = student(image_penalty)[:, :out_channels]
+                loss_penalty = torch.mean(student_output_penalty**2)
+                loss_st = loss_hard + loss_penalty
+            else:
+                loss_st = loss_hard
 
-        if image_penalty is not None:
-            student_output_penalty = student(image_penalty)[:, :out_channels]
-            loss_penalty = torch.mean(student_output_penalty**2)
-            loss_st = loss_hard + loss_penalty
-        else:
-            loss_st = loss_hard
+            ae_output = autoencoder(image_ae)
+            with torch.no_grad():
+                teacher_output_ae = teacher(image_ae)
+                teacher_output_ae = (teacher_output_ae - teacher_mean) / teacher_std
+            student_output_ae = student(image_ae)[:, out_channels:]
+            distance_ae = (teacher_output_ae - ae_output)**2
+            distance_stae = (ae_output - student_output_ae)**2
+            loss_ae = torch.mean(distance_ae)
+            loss_stae = torch.mean(distance_stae)
+            loss_total = loss_st + loss_ae + loss_stae
 
-        ae_output = autoencoder(image_ae)
-        with torch.no_grad():
-            teacher_output_ae = teacher(image_ae)
-            teacher_output_ae = (teacher_output_ae - teacher_mean) / teacher_std
-        student_output_ae = student(image_ae)[:, out_channels:]
-        distance_ae = (teacher_output_ae - ae_output)**2
-        distance_stae = (ae_output - student_output_ae)**2
-        loss_ae = torch.mean(distance_ae)
-        loss_stae = torch.mean(distance_stae)
-        loss_total = loss_st + loss_ae + loss_stae
+            train_loss_avg += loss_total.item()
+            log_metric("Average training loss", train_loss_avg/(iteration+1), iteration+1)
 
-        optimizer.zero_grad()
-        loss_total.backward()
-        optimizer.step()
-        scheduler.step()
+            optimizer.zero_grad()
+            loss_total.backward()
+            optimizer.step()
+            scheduler.step()
 
-        if iteration % 10 == 0:
-            tqdm_obj.set_description(
-                "Current loss: {:.4f}  ".format(loss_total.item()))
+            if iteration % 10 == 0:
+                tqdm_obj.set_description(
+                    "Current loss: {:.4f}  ".format(loss_total.item()))
 
-        if iteration % 1000 == 0:
-            torch.save(teacher, os.path.join(train_output_dir,
-                                             'teacher_tmp.pth'))
-            torch.save(student, os.path.join(train_output_dir,
-                                             'student_tmp.pth'))
-            torch.save(autoencoder, os.path.join(train_output_dir,
-                                                 'autoencoder_tmp.pth'))
+            if iteration % 1000 == 0:
+                torch.save(teacher, os.path.join(train_output_dir,
+                                                 'teacher_tmp.pth'))
+                torch.save(student, os.path.join(train_output_dir,
+                                                 'student_tmp.pth'))
+                torch.save(autoencoder, os.path.join(train_output_dir,
+                                                     'autoencoder_tmp.pth'))
 
-        if iteration % 10000 == 0 and iteration > 0:
-            # run intermediate evaluation
-            teacher.eval()
-            student.eval()
-            autoencoder.eval()
+            if iteration % 10000 == 0 and iteration > 0:
+                # run intermediate evaluation
+                teacher.eval()
+                student.eval()
+                autoencoder.eval()
 
-            q_st_start, q_st_end, q_ae_start, q_ae_end = map_normalization(
-                validation_loader=validation_loader, teacher=teacher,
-                student=student, autoencoder=autoencoder,
-                teacher_mean=teacher_mean, teacher_std=teacher_std,
-                desc='Intermediate map normalization')
-            auc = test(
-                test_set=test_set, teacher=teacher, student=student,
-                autoencoder=autoencoder, teacher_mean=teacher_mean,
-                teacher_std=teacher_std, q_st_start=q_st_start,
-                q_st_end=q_st_end, q_ae_start=q_ae_start, q_ae_end=q_ae_end,
-                test_output_dir=None, desc='Intermediate inference')
-            print('Intermediate image auc: {:.4f}'.format(auc))
+                q_st_start, q_st_end, q_ae_start, q_ae_end = map_normalization(
+                    validation_loader=validation_loader, teacher=teacher,
+                    student=student, autoencoder=autoencoder,
+                    teacher_mean=teacher_mean, teacher_std=teacher_std,
+                    desc='Intermediate map normalization')
+                auc, f1 = test(
+                    test_set=test_set, teacher=teacher, student=student,
+                    autoencoder=autoencoder, teacher_mean=teacher_mean,
+                    teacher_std=teacher_std, q_st_start=q_st_start,
+                    q_st_end=q_st_end, q_ae_start=q_ae_start, q_ae_end=q_ae_end,
+                    test_output_dir=None, desc='Intermediate inference')
+                print('Intermediate image auc: {:.4f}, image F1: {:.4f}'.format(auc, f1))
 
-            # teacher frozen
-            teacher.eval()
-            student.train()
-            autoencoder.train()
+                log_metric("Test image AUC", auc, iteration+1)
+                log_metric("Test image F1", f1, iteration+1)
 
-    teacher.eval()
-    student.eval()
-    autoencoder.eval()
+                # teacher frozen
+                teacher.eval()
+                student.train()
+                autoencoder.train()
 
-    torch.save(teacher, os.path.join(train_output_dir, 'teacher_final.pth'))
-    torch.save(student, os.path.join(train_output_dir, 'student_final.pth'))
-    torch.save(autoencoder, os.path.join(train_output_dir,
-                                         'autoencoder_final.pth'))
+        teacher.eval()
+        student.eval()
+        autoencoder.eval()
 
-    q_st_start, q_st_end, q_ae_start, q_ae_end = map_normalization(
-        validation_loader=validation_loader, teacher=teacher, student=student,
-        autoencoder=autoencoder, teacher_mean=teacher_mean,
-        teacher_std=teacher_std, desc='Final map normalization')
-    auc = test(
-        test_set=test_set, teacher=teacher, student=student,
-        autoencoder=autoencoder, teacher_mean=teacher_mean,
-        teacher_std=teacher_std, q_st_start=q_st_start, q_st_end=q_st_end,
-        q_ae_start=q_ae_start, q_ae_end=q_ae_end,
-        test_output_dir=test_output_dir, desc='Final inference')
-    print('Final image auc: {:.4f}'.format(auc))
+        torch.save(teacher, os.path.join(train_output_dir, 'teacher_final.pth'))
+        torch.save(student, os.path.join(train_output_dir, 'student_final.pth'))
+        torch.save(autoencoder, os.path.join(train_output_dir, 'autoencoder_final.pth'))
+
+        q_st_start, q_st_end, q_ae_start, q_ae_end = map_normalization(
+            validation_loader=validation_loader, teacher=teacher, student=student,
+            autoencoder=autoencoder, teacher_mean=teacher_mean,
+            teacher_std=teacher_std, desc='Final map normalization')
+        auc, f1 = test(
+            test_set=test_set, teacher=teacher, student=student,
+            autoencoder=autoencoder, teacher_mean=teacher_mean,
+            teacher_std=teacher_std, q_st_start=q_st_start, q_st_end=q_st_end,
+            q_ae_start=q_ae_start, q_ae_end=q_ae_end,
+            test_output_dir=test_output_dir, desc='Final inference')
+
+        log_metric("Test image AUC", auc, iteration)
+        log_metric("Test image F1", f1, iteration)
+
+        print('Final evaluation on test set, image classification auc: {:.4f}, F1: {:.4f}'.format(auc, f1))
+
+        mlflow.end_run()
+
+    else:
+        q_st_start, q_st_end, q_ae_start, q_ae_end = map_normalization(
+            validation_loader=validation_loader, teacher=teacher, student=student,
+            autoencoder=autoencoder, teacher_mean=teacher_mean,
+            teacher_std=teacher_std, desc='After training map normalization')
+        auc, f1 = test(
+            test_set=test_set, teacher=teacher, student=student,
+            autoencoder=autoencoder, teacher_mean=teacher_mean,
+            teacher_std=teacher_std, q_st_start=q_st_start, q_st_end=q_st_end,
+            q_ae_start=q_ae_start, q_ae_end=q_ae_end,
+            test_output_dir=test_output_dir, desc='Only for inference')
+        print('Evaluation on test set, image classification auc: {:.4f}, F1: {:.4f}'.format(auc, f1))
+
 
 def test(test_set, teacher, student, autoencoder, teacher_mean, teacher_std,
          q_st_start, q_st_end, q_ae_start, q_ae_end, test_output_dir=None,
          desc='Running inference'):
     y_true = []
     y_score = []
+    prediction_infos = []
+    prediction_infos.append(['Defect type', 'Image Nr.', 'Groud truth', 'Prediction'])
+    defect_types = []
+    image_ids= []
     for image, target, path in tqdm(test_set, desc=desc):
         orig_width = image.width
         orig_height = image.height
@@ -271,6 +365,7 @@ def test(test_set, teacher, student, autoencoder, teacher_mean, teacher_std,
         image = image[None]
         if on_gpu:
             image = image.cuda()
+
         map_combined, map_st, map_ae = predict(
             image=image, teacher=teacher, student=student,
             autoencoder=autoencoder, teacher_mean=teacher_mean,
@@ -282,19 +377,51 @@ def test(test_set, teacher, student, autoencoder, teacher_mean, teacher_std,
         map_combined = map_combined[0, 0].cpu().numpy()
 
         defect_class = os.path.basename(os.path.dirname(path))
+        defect_types.append(defect_class)
+        image_ids.append(os.path.split(path)[1].split('.')[0])
         if test_output_dir is not None:
+            # the predictions are saved as tiff files and then used for piexl-level evaluation in mvtec_ad_evaluation/evaluate_experiment.py
+            # img_nm = os.path.split(path)[1].split('.')[0]
+            # if not os.path.exists(os.path.join(test_output_dir, defect_class)):
+            #     os.makedirs(os.path.join(test_output_dir, defect_class))
+            # file = os.path.join(test_output_dir, defect_class, img_nm + '.tiff')
+            # tifffile.imwrite(file, map_combined)
+
+            # we save the originam image and anomaly maps for comparision.
             img_nm = os.path.split(path)[1].split('.')[0]
             if not os.path.exists(os.path.join(test_output_dir, defect_class)):
                 os.makedirs(os.path.join(test_output_dir, defect_class))
-            file = os.path.join(test_output_dir, defect_class, img_nm + '.tiff')
-            tifffile.imwrite(file, map_combined)
+            file = os.path.join(test_output_dir, defect_class, img_nm + '.png')
+
+            fig, axs = plt.subplots(1, 2, figsize=(6, 6))
+            axs[0].imshow(np.clip(image[0].cpu().numpy().transpose(1, 2, 0), 0, 1))
+            axs[1].imshow(map_combined)
+            axs[0].axis('off')
+            axs[1].axis('off')
+
+            plt.savefig(file, bbox_inches='tight', pad_inches=0)
+            plt.close()
 
         y_true_image = 0 if defect_class == 'good' else 1
         y_score_image = np.max(map_combined)
         y_true.append(y_true_image)
         y_score.append(y_score_image)
+
     auc = roc_auc_score(y_true=y_true, y_score=y_score)
-    return auc * 100
+    # F1 score
+    img_f1, img_threshold = calculate_f1_max(np.array(y_true), np.array(y_score))
+
+    # save image-wise info.
+    for defect_type, image_id, y_true_image, y_score_image in zip(defect_types, image_ids, y_true, y_score):
+        y_true_image = 'good' if y_true_image == 0 else 'anomalous'
+        y_score_image = 'good' if y_score_image < img_threshold else 'anomalous'
+        prediction_infos.append([defect_type, image_id, y_true_image, y_score_image])
+
+    with open('evaluation_results.csv', 'w', newline='') as csv_file:
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerows(prediction_infos)
+
+    return auc * 100, img_f1 * 100
 
 @torch.no_grad()
 def predict(image, teacher, student, autoencoder, teacher_mean, teacher_std,
