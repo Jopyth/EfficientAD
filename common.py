@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 from torch import nn
 from torchvision.datasets import ImageFolder
+from sklearn.metrics import precision_recall_curve
+import numpy as np
 
 def get_autoencoder(out_channels=384):
     return nn.Sequential(
@@ -118,3 +120,14 @@ def InfiniteDataloader(loader):
             yield next(iterator)
         except StopIteration:
             iterator = iter(loader)
+
+# F1 evalution code from https://github.com/caoyunkang/WinClip
+def calculate_f1_max(gt, scores):
+    precision, recall, thresholds = precision_recall_curve(gt, scores)
+    a = 2 * precision * recall
+    b = precision + recall
+    f1s = np.divide(a, b, out=np.zeros_like(a), where=b != 0)
+    index = np.argmax(f1s)
+    max_f1 = f1s[index]
+    threshold = thresholds[index]
+    return max_f1, threshold
