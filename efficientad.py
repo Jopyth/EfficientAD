@@ -13,6 +13,7 @@ from tqdm import tqdm
 from common import get_autoencoder, get_pdn_small, get_pdn_medium, \
     ImageFolderWithoutTarget, ImageFolderWithPath, SingleFolderWithoutTarget, InfiniteDataloader, calculate_f1_max
 from sklearn.metrics import roc_auc_score
+from azureml.core import Workspace
 
 import matplotlib.pyplot as plt
 import csv
@@ -136,11 +137,13 @@ def main():
         full_train_set = ImageFolderWithoutTarget(
             os.path.join(dataset_path, config.subdataset, 'train'),
             transform=transforms.Lambda(train_transform))
+        print(f"loaded {len(full_train_set)} images (with augmentation).")
     else:
         full_train_set = SingleFolderWithoutTarget(
             os.path.join(dataset_path, config.subdataset, 'train'), 
             'good',
             transform=transforms.Lambda(train_transform))
+        print(f"loaded {len(full_train_set)} images (without augmentation).")
 
     if config.dataset == 'mvtec_ad':
         # mvtec dataset paper recommend 10% validation set
@@ -218,7 +221,6 @@ def main():
 
     teacher_mean, teacher_std = teacher_normalization(teacher, train_loader)
 
-
     if not config.stage_inference:
         optimizer = torch.optim.Adam(itertools.chain(student.parameters(),
                                                      autoencoder.parameters()),
@@ -227,9 +229,30 @@ def main():
             optimizer, step_size=int(0.95 * config.train_steps), gamma=0.1)
         tqdm_obj = tqdm(range(config.train_steps))
 
-        train_loss_avg = 0.
+        workspace = Workspace.from_config()
+        mlflow_tracking_uri = workspace.get_mlflow_tracking_uri()
+
+        mlflow.set_tracking_uri(mlflow_tracking_uri)
+        mlflow.set_experiment("EfficientAD")
         mlflow.start_run()
-        mlflow.log_artifacts(config.output_dir)
+        print("Tracking URI:", mlflow_tracking_uri)
+
+        params_to_log = [
+            "dataset",
+            "subdataset",
+            "output_dir",
+            "model_size",
+            "imagenet_train_path",
+            "train_steps",
+            "stage_inference",
+            "img_aug",
+        ]
+
+        param_log_dict = {key: vars(config)[key] for key in params_to_log}
+        print(param_log_dict)
+        mlflow.log_params(param_log_dict)
+
+        train_loss_avg = 0.
         for iteration, (image_st, image_ae), image_penalty in zip(
                 tqdm_obj, train_loader_infinite, penalty_loader_infinite):
             if on_gpu:
@@ -331,6 +354,8 @@ def main():
 
         log_metric("Test image AUC", auc, iteration)
         log_metric("Test image F1", f1, iteration)
+        mlflow.log_artifacts(train_output_dir, "train")
+        mlflow.log_artifacts(test_output_dir, "test")
 
         print('Final evaluation on test set, image classification auc: {:.4f}, F1: {:.4f}'.format(auc, f1))
 
