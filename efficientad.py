@@ -11,7 +11,7 @@ import os
 import random
 from tqdm import tqdm
 from common import get_autoencoder, get_pdn_small, get_pdn_medium, \
-    ImageFolderWithoutTarget, ImageFolderWithPath, InfiniteDataloader, calculate_f1_max
+    ImageFolderWithoutTarget, ImageFolderWithPath, SingleFolderWithoutTarget, InfiniteDataloader, calculate_f1_max
 from sklearn.metrics import roc_auc_score
 
 import matplotlib.pyplot as plt
@@ -42,7 +42,7 @@ def get_argparse():
     parser.add_argument('-b', '--mvtec_loco_path',
                         default='./mvtec_loco_anomaly_detection',
                         help='Downloaded Mvtec LOCO dataset')
-    parser.add_argument('-t', '--train_steps', type=int, default=70000)
+    parser.add_argument('-t', '--train_steps', type=int, default=7000)
 
     parser.add_argument('-sf', '--stage_inference', action='store_true')
     parser.add_argument('-aug', '--img_aug', action='store_true')
@@ -137,8 +137,9 @@ def main():
             os.path.join(dataset_path, config.subdataset, 'train'),
             transform=transforms.Lambda(train_transform))
     else:
-        full_train_set = ImageFolderWithoutTarget(
-            os.path.join(dataset_path, config.subdataset, 'train', 'good'),
+        full_train_set = SingleFolderWithoutTarget(
+            os.path.join(dataset_path, config.subdataset, 'train'), 
+            'good',
             transform=transforms.Lambda(train_transform))
 
     if config.dataset == 'mvtec_ad':
@@ -282,7 +283,7 @@ def main():
                 torch.save(autoencoder, os.path.join(train_output_dir,
                                                      'autoencoder_tmp.pth'))
 
-            if iteration % 10000 == 0 and iteration > 0:
+            if iteration % 1000 == 0 and iteration > 0:
                 # run intermediate evaluation
                 teacher.eval()
                 student.eval()

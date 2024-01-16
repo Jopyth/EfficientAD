@@ -1,9 +1,12 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 from torch import nn
-from torchvision.datasets import ImageFolder
+from torchvision.datasets import ImageFolder, DatasetFolder, VisionDataset
+from torchvision.io import read_image
 from sklearn.metrics import precision_recall_curve
 import numpy as np
+import os
+from PIL import Image
 
 def get_autoencoder(out_channels=384):
     return nn.Sequential(
@@ -106,6 +109,23 @@ class ImageFolderWithoutTarget(ImageFolder):
     def __getitem__(self, index):
         sample, target = super().__getitem__(index)
         return sample
+
+class SingleFolderWithoutTarget(VisionDataset):
+    def __init__(self, root, subdirectory, transform=None, target_transform=None):
+        super(SingleFolderWithoutTarget, self).__init__(root, transform=transform, target_transform=target_transform)
+        self.root = os.path.join(root, subdirectory)
+        self.image_paths = [os.path.join(self.root, filename) for filename in os.listdir(self.root)]
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, index):
+        path = self.image_paths[index]
+        sample = Image.open(path)
+        if self.transform is not None:
+            sample = self.transform(sample)
+        return sample
+
 
 class ImageFolderWithPath(ImageFolder):
     def __getitem__(self, index):
