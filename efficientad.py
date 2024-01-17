@@ -350,7 +350,7 @@ def main():
             autoencoder=autoencoder, teacher_mean=teacher_mean,
             teacher_std=teacher_std, q_st_start=q_st_start, q_st_end=q_st_end,
             q_ae_start=q_ae_start, q_ae_end=q_ae_end,
-            test_output_dir=test_output_dir, desc='Final inference')
+            test_output_dir=test_output_dir, desc='Final inference', config=config)
 
         log_metric("Test image AUC", auc, iteration)
         log_metric("Test image F1", f1, iteration)
@@ -371,17 +371,17 @@ def main():
             autoencoder=autoencoder, teacher_mean=teacher_mean,
             teacher_std=teacher_std, q_st_start=q_st_start, q_st_end=q_st_end,
             q_ae_start=q_ae_start, q_ae_end=q_ae_end,
-            test_output_dir=test_output_dir, desc='Only for inference')
+            test_output_dir=test_output_dir, desc='Only for inference', config=config)
         print('Evaluation on test set, image classification auc: {:.4f}, F1: {:.4f}'.format(auc, f1))
 
 
 def test(test_set, teacher, student, autoencoder, teacher_mean, teacher_std,
          q_st_start, q_st_end, q_ae_start, q_ae_end, test_output_dir=None,
-         desc='Running inference'):
+         desc='Running inference', config=None):
     y_true = []
     y_score = []
     prediction_infos = []
-    prediction_infos.append(['Defect type', 'Image Nr.', 'Groud truth', 'Prediction'])
+    prediction_infos.append(['Defect type', 'Image Nr.', 'Groud truth', 'Prediction', 'Ground truth label', 'Anomaly score'])
     defect_types = []
     image_ids= []
     for image, target, path in tqdm(test_set, desc=desc):
@@ -437,15 +437,16 @@ def test(test_set, teacher, student, autoencoder, teacher_mean, teacher_std,
     # F1 score
     img_f1, img_threshold = calculate_f1_max(np.array(y_true), np.array(y_score))
 
-    # save image-wise info.
-    for defect_type, image_id, y_true_image, y_score_image in zip(defect_types, image_ids, y_true, y_score):
-        y_true_image = 'good' if y_true_image == 0 else 'anomalous'
-        y_score_image = 'good' if y_score_image < img_threshold else 'anomalous'
-        prediction_infos.append([defect_type, image_id, y_true_image, y_score_image])
+    if config is not None: 
+        # save image-wise info.
+        for defect_type, image_id, y_true_image, y_score_image in zip(defect_types, image_ids, y_true, y_score):
+            y_true_image_str = 'good' if y_true_image == 0 else 'anomalous'
+            y_score_image_str = 'good' if y_score_image < img_threshold else 'anomalous'
+            prediction_infos.append([defect_type, image_id, y_true_image_str, y_score_image_str, y_true_image, y_score_image])
 
-    with open('evaluation_results.csv', 'w', newline='') as csv_file:
-        csv_writer = csv.writer(csv_file)
-        csv_writer.writerows(prediction_infos)
+        with open('predictions_' + config.subdataset + '.csv', 'w', newline='') as csv_file:
+            csv_writer = csv.writer(csv_file)
+            csv_writer.writerows(prediction_infos)
 
     return auc * 100, img_f1 * 100
 

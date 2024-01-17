@@ -68,3 +68,9 @@ If trained models are available, only conduct inference and evaluation:
 ```
 python efficientad.py --dataset mvtec_ad --subdataset bottle --stage_inference
 ```
+
+When evaluation results on individual classes are available, summarize and compute global F1 over all classes:
+
+```
+python results_summarization.py
+```
